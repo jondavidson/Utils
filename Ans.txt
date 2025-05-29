@@ -1,0 +1,192 @@
+Below is a minimal but complete Ansible skeleton that
+
+logs-in as your ordinary LDAP/AD user myuser,
+
+escalates only when a task needs elevated rights through PowerBroker (pbrun),
+
+lays down the byte-identical Conda tarball you built with Mamba,
+
+and keeps all settings in version control so every teammate has the same defaults.
+
+
+You can drop these four files in the root of your repo and run the same ansible-playbook command I used as an example earlier.
+
+
+---
+
+1 ansible.cfg
+
+[defaults]
+inventory          = ./inventory        # file below
+remote_user        = myuser             # your normal login
+stdout_callback    = yaml
+interpreter_python = auto
+host_key_checking  = False
+retry_files_enabled = False
+timeout            = 20                 # ssh socket timeout
+
+[privilege_escalation]
+# tell Ansible *how* to raise privileges; actual elevation is opt-in per task
+become_method      = community.general.pbrun   # PowerBroker plugin
+
+[ssh_connection]
+# optional QoL
+pipelining         = True
+control_master     = auto
+control_path       = ~/.ssh/ansible-%%h-%%p-%%r
+control_persist    = 10m
+
+Why the namespaced method? — The pbrun become plugin lives in the community.general collection; specifying the fully-qualified community.general.pbrun avoids plugin-loader ambiguity .
+
+
+---
+
+2 inventory
+
+[dask_scheduler]
+scheduler ansible_host=10.0.0.10
+
+[dask_workers]
+worker1 ansible_host=10.0.0.11
+worker2 ansible_host=10.0.0.12
+worker3 ansible_host=10.0.0.13
+worker4 ansible_host=10.0.0.14
+
+[all:vars]                 # connection / escalate defaults
+ansible_user=myuser
+ansible_become_method=community.general.pbrun
+ansible_become_user=root   # or svc_dask if PB policy prefers a service user
+
+If your PB policy needs a password, add either
+ansible_become_password=<vault lookup> or run the playbook with -K
+to prompt interactively.
+
+
+---
+
+3 group_vars/all.yml
+
+# variables used by the playbook
+git_sha: "{{ lookup('pipe', 'git rev-parse --short HEAD') }}"
+env_tarball: "dask25-{{ git_sha }}.tar.gz"
+env_target: "/opt/dask25_{{ git_sha }}"
+current_link: "/opt/dask25"
+
+
+---
+
+4 deploy.yml – the playbook
+
+---
+- name: Deploy or refresh the packed Conda env
+  hosts: dask_scheduler,dask_workers
+  gather_facts: yes
+
+  vars_files:
+    - group_vars/all.yml
+
+  pre_tasks:
+    - name: Ensure community.general is present on control node
+      delegate_to: localhost
+      ansible.builtin.command:
+        cmd: ansible-galaxy collection install community.general
+      changed_when: false
+
+  tasks:
+    - name: Upload env tarball (runs as myuser, no privileges needed)
+      copy:
+        src: "env/pack/{{ env_tarball }}"
+        dest: "/tmp/{{ env_tarball }}"
+        mode: '0644'
+
+    - name: Create target directory
+      file:
+        path: "{{ env_target }}"
+        state: directory
+        mode: '0755'
+      become: true                 # <-- pbrun escalates *only* here
+
+    - name: Unpack environment
+      unarchive:
+        src: "/tmp/{{ env_tarball }}"
+        dest: "{{ env_target }}"
+        remote_src: yes
+      become: true
+
+    - name: Atomically update /opt/dask25 → new release
+      file:
+        src: "{{ env_target }}"
+        dest: "{{ current_link }}"
+        state: link
+        force: true
+      become: true
+
+    - name: Clean staging tarball
+      file:
+        path: "/tmp/{{ env_tarball }}"
+        state: absent
+      become: true
+
+How privilege switching works
+
+Every task without become: true runs as myuser.
+
+Tasks with become: true are executed through
+pbrun -u {{ ansible_become_user }} under the hood.
+
+You can target a different PB role on a single task:
+
+- name: Start worker service as svc_dask
+  systemd:
+    name: dask-worker@%i
+    state: restarted
+    enabled: yes
+  become: true
+  become_user: svc_dask      # overrides root just for this task
+
+Ansible’s become system is designed exactly for this selective escalation .
+
+
+
+---
+
+5 Command you run from your laptop / CI runner
+
+ansible-playbook -i inventory deploy.yml \
+                 -e "git_sha=$(git rev-parse --short HEAD)"
+
+git rev-parse --short HEAD injects the commit SHA so the playbook unpacks the tarball that matches the code you just built.
+
+
+
+---
+
+6 Installing the tooling itself
+
+# Mamba (fast Conda client) – pick ONE of the three; here a fresh Miniforge:
+curl -LO https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh
+bash Miniforge3-Linux-x86_64.sh -b -p $HOME/mambaforge
+eval "$($HOME/mambaforge/bin/conda shell.bash hook)"
+
+# Ansible + community.general (includes pbrun plugin)
+python3 -m pip install --user pipx
+pipx install --include-deps ansible
+ansible-galaxy collection install community.general
+
+mamba is a C++ re-implementation of Conda’s solver/downloader that cuts env-build times dramatically .
+community.general.pbrun is the official become plugin that delegates privilege escalation to BeyondTrust PowerBroker .
+
+
+---
+
+What you now have
+
+Repeatable builds – one SHA → one packed Conda env.
+
+Repeatable deployments – one playbook run brings all hosts to the same state.
+
+Controlled privilege escalation – PB (pbrun) only on the handful of tasks that genuinely need it; everything else stays under your normal user, keeping audit logs clean.
+
+
+Copy these files into a fresh repo, adjust hostnames and paths, and you have a production-grade foundation for your Conda-based Dask cluster.
+
