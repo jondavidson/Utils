@@ -1,0 +1,171 @@
+Below is a clean-slate workflow that removes the “editable /-e install” problem, rebuilds your project as a real package, and lets conda-pack succeed every time. I show two routes—wheel-only (quick) and full Conda recipe (robust, publishable). Pick whichever matches your release discipline.
+
+
+---
+
+0  Why conda-pack chokes on editable installs
+
+pip install -e . leaves an .egg-link file in site-packages pointing back to your source tree.
+conda-pack refuses to copy that symlink because it would break once you move the tarball to another host. The fix is simply: don’t ship editable installs—ship immutable artefacts (wheel or Conda package).
+
+
+---
+
+1  Prep: modernise the build metadata (once)
+
+# pyproject.toml  ← keep setup.py for now, but this future-proofs you
+[build-system]
+requires = ["setuptools>=68", "wheel", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mypackage"
+version = "0.4.0"
+authors = [{ name = "You", email = "you@corp" }]
+requires-python = ">=3.12"
+dependencies = [
+    "polars >=0.20,<0.21",
+    "pyarrow >=15",
+    # …
+]
+
+Nothing stops you keeping setup.py—conda-build can still call pip install .—but a pyproject.toml is now the canonical way.
+
+
+---
+
+2  Route A – build a wheel and install it (fastest CI path)
+
+# build the artefact
+python -m pip install --upgrade build          # pep-517 frontend
+python -m build --wheel                        # → dist/mypackage-0.4.0-py3-none-any.whl
+
+Build the runtime env without editable mode
+
+mamba create -n dask25 -f env/environment.yml -y
+conda activate dask25
+pip install dist/mypackage-0.4.0-py3-none-any.whl
+
+Now conda pack -n dask25 -o dask25-0.4.0.tar.gz will succeed because every file lives inside the environment.
+
+> CI snippet
+
+
+
+- name: Build wheel
+  run: |
+    python -m build --wheel
+- name: Bake runtime env
+  run: |
+    mamba create -p /tmp/dask25 -y --file env/lock/linux-64.lock
+    pip install dist/*.whl
+    conda pack -p /tmp/dask25 -o env/pack/dask25-${{ github.sha }}.tar.gz
+
+
+---
+
+3  Route B – build a real Conda package (best for reproducibility, air-gap clusters)
+
+3.1 Generate a skeleton recipe once
+
+conda install -n base conda-build conda-verify                  # tooling
+conda skeleton pypi ./dist/mypackage-0.4.0-py3-none-any.whl \
+        --output-dir conda-recipe                               # optional
+
+…but hand-crafted is clearer:
+
+# conda-recipe/meta.yaml  (minimal noarch example)
+{% set name = "mypackage" %}
+{% set version = "0.4.0" %}
+
+package:
+  name: {{ name|lower }}
+  version: {{ version }}
+
+source:
+  path: ../../                # repo root; conda-build copies it
+
+build:
+  noarch: python
+  script: "{{ PYTHON }} -m pip install . --no-deps -vv"
+
+requirements:
+  host:
+    - python >=3.12
+    - pip
+  run:
+    - python >=3.12
+    - polars >=0.20,<0.21
+    - pyarrow >=15
+    # …
+
+about:
+  license: MIT
+  summary: Awesome Dask pipeline helpers.
+
+3.2 Build & test
+
+CONDA_BLD_PATH=/tmp/conda-bld \
+mamba mambabuild conda-recipe         # ‘mamba-build’ inside conda-build >=3.26
+
+You get
+/tmp/conda-bld/noarch/mypackage-0.4.0-py_0.tar.bz2
+
+3.3 Create the runtime env from only Conda artefacts
+
+mamba create -p /tmp/dask25 -y \
+    --file env/lock/linux-64.lock \
+    /tmp/conda-bld/noarch/mypackage-0.4.0-py_0.tar.bz2
+conda pack -p /tmp/dask25 -o env/pack/dask25-0.4.0.tar.gz
+
+You can anaconda upload or host the package on a private channel; the playbook would then install it via mamba install -c your-channel mypackage==0.4.0.
+
+
+---
+
+4  CI clean-up & guardrails
+
+1. Uninstall editable copies first in your build job:
+
+pip uninstall -y mypackage || true
+
+
+2. Fail the build if any .egg-link still sneaks in:
+
+test -z "$(python - <<'PY'
+
+
+
+import sys, site, pathlib, json, sysconfig, itertools as it sp = pathlib.Path(site.getsitepackages()[0]) links = list(sp.glob("*.egg-link")) print(json.dumps([str(p) for p in links])) sys.exit(bool(links)) PY )" || { echo "Editable installs detected!" ; exit 1 ; }
+
+3. **Pin Python 3.12** everywhere:
+
+* In `environment.yml`  
+  ```yaml
+  - python=3.12.*
+  ```
+* In Conda recipe’s **`host:`** and **`run:`** sections  
+  `python >=3.12`
+
+---
+
+## 5  Quick decision grid
+
+| Need | Route A (wheel) | Route B (Conda recipe) |
+|------|-----------------|------------------------|
+| Fastest turnaround | **✔** build in seconds | build minutes (conda-build) |
+| Works with `conda-pack` | ✔ | ✔ |
+| Air-gapped / no pip on target | — | **✔** |
+| Publish to others via `conda install mypackage` | — | **✔** |
+| Pure-Python package today, native code tomorrow | fine (wheel w/ manylinux) | **future-proof** (ABI-specific) |
+
+---
+
+### TL;DR
+
+* **Stop shipping `pip install -e`**—build a wheel or a Conda package.
+* **Route A**: `python -m build --wheel` → `pip install dist/*.whl` inside the env → `conda-pack`.
+* **Route B**: write a `meta.yaml`, `mamba mambabuild .` → `mamba install` the built tar.bz2 → `conda-pack`.
+
+Either way, `conda-pack` now sees only immutable files and gladly produces a relocatable tarball for your SSHCluster deployment.
+
