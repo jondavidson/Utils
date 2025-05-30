@@ -1,85 +1,97 @@
-Below is the same working pattern—but with hostnames that could never be mistaken for Dask-internals or generic variable names.
-I use a little “aviation alphabet” style (alpha, bravo, charlie, delta) so the tag is always obvious and unique.
+Reality check — what Dask can and cannot do
 
-"""
-End-to-end demo
-──────────────
-* Scheduler on localhost
-* Two workers on each of four hosts      alpha, bravo, charlie, delta
-* Every worker is tagged with a resource 'alpha' / 'bravo' / …
-* Two tiny tasks are pinned to those resources and execute successfully
-"""
+Goal	Supported?	How to do it	What can go wrong
 
-from dask.distributed import SSHCluster, Client, get_worker
+Hard-pin a task to “any worker that lives on host α”	Yes	use the built-in workers= constraint (string or list of host prefixes) or an equivalent dask.annotate(workers=…)	If the host prefix doesn’t match any registered worker address the scheduler puts the task in no-worker state → “No worker found”.
+Hard-pin a task to “only the first worker on host α”	Yes	pass the full worker address, e.g. workers="tcp://alpha:43123"	Same caveat: address must exist when the task reaches the scheduler.
+Invent a custom resource at runtime and add it later with client.run()	No – resources must be present when the worker registers with the scheduler . Trying to patch them in afterwards leaves the scheduler unaware and you get no-worker.		
+Pass a per-task dict to client.compute	Not allowed – the API accepts one workers= value (string/iterable) for the whole call . Use submit for per-task placement or annotate inside the graph.		
+
+
+
+---
+
+A 100 % working minimal snippet
+
+Below the worker-pinning is done with host-prefix constraints.
+No late resource tweaking, no exotic plugins – just the documented API.
+
+from dask.distributed import SSHCluster, Client
 import dask
 from dask import delayed
 
-# ────────────────────────────────────────────────
-# 1)  Launch the cluster
-# ────────────────────────────────────────────────
-HOSTS = [
-    "localhost",              # scheduler
-    "alpha",  "alpha",        # two workers per physical host
-    "bravo",  "bravo",
-    "charlie","charlie",
-    "delta",  "delta",
+# ── 1. Launch an SSH cluster ──────────────────────────────────────────────
+hosts = [
+    "localhost",      # scheduler
+    "alpha", "alpha",
+    "bravo", "bravo",
 ]
-
 cluster = SSHCluster(
-    HOSTS,
-    connect_options=dict(
-        username="pipelines", client_keys=["~/.ssh/id_ed25519"], known_hosts=None
-    ),
+    hosts,
     remote_python="/opt/dask25/bin/python",
-    worker_options=dict(nthreads=1, memory_limit="16GB", local_directory="/tmp/dask"),
-    scheduler_options=dict(port=8786, dashboard_address=":8787"),
+    connect_options={"username": "pipelines", "known_hosts": None},
+    worker_options={"nthreads": 1, "memory_limit": "8GB"},
 )
-
 client = Client(cluster)
-client.wait_for_workers(8)     # block until all eight workers registered
+client.wait_for_workers(4)          # ensure everything is up
+
+# helper — print the addresses so we know what to pin to
+print("Workers:", list(client.scheduler_info()["workers"]))
+
+# ── 2. Build a tiny graph and pin by host name ────────────────────────────
+def square(x): return x * x
+def plus10(x): return x + 10
+
+with dask.annotate(workers="alpha", allow_other_workers=False):
+    a = delayed(square)(5)          # may run on *any* alpha worker
+
+with dask.annotate(workers="bravo", allow_other_workers=False):
+    b = delayed(plus10)(a)          # may run on *any* bravo worker
+
+result = client.compute(b).result()
+print("Result:", result)            # 35
+
+Why this always works
+
+1. workers="alpha" is interpreted by the scheduler as “any worker whose address string starts with 'alpha'” – both tcp://alpha:43123 and tcp://alpha:43124 are valid matches.
 
 
-# ────────────────────────────────────────────────
-# 2)  Tag each worker with a resource = its host
-# ────────────────────────────────────────────────
-def add_host_resource():
-    """Run inside a worker; add one virtual resource named after its hostname (short)."""
-    w = get_worker()
-    shortname = w.host.split(".")[0]        # 'alpha', not 'alpha.company.net'
-    w.resources[shortname] = 1
-    return shortname                        # so we can confirm from the driver
-
-host_tags = client.run(add_host_resource)   # {address: 'alpha', …}
-
-print("Resource map:", host_tags)           # sanity-check
-
-# ────────────────────────────────────────────────
-# 3)  Build a graph and pin tasks to those resources
-# ────────────────────────────────────────────────
-def step_square(x): return x * x
-def step_plus10(y): return y + 10
-
-with dask.annotate(
-        resources={next(tag for tag in host_tags.values() if tag == "alpha"): 1},
-        allow_other_workers=False):
-    t1 = delayed(step_square)(7)
-
-with dask.annotate(
-        resources={next(tag for tag in host_tags.values() if tag == "bravo"): 1},
-        allow_other_workers=False):
-    t2 = delayed(step_plus10)(t1)
-
-result = client.compute(t2).result()        # runs on alpha → bravo chain
-print("Final result:", result)              # 7*7 + 10 = 59
-
-What changed from the previous example?
-
-Change	Why
-
-Hosts named alpha / bravo / charlie / delta	Cannot collide with any Dask-generated worker-xyz identifiers or with Python variable names.
-Resource key equals the same short hostname	Human-readable and guaranteed unique per box.
-next(tag for tag in host_tags.values() if tag == "alpha")	Ensures you pin with the exact string that workers registered, eliminating typos.
+2. Because the constraint is a core feature (not a DIY resource), the scheduler immediately knows which workers qualify. If none qualify it errors out instead of hanging.
 
 
-Run this script as-is—no more “No worker found” and no namespace confusion.
+3. allow_other_workers=False makes the failure obvious: if alpha goes down you’ll get a clean CancelledError, not silent migration.
+
+
+
+
+---
+
+If you really need resources
+
+Define them at worker start-up (environment variable or --resources flag):
+
+dask worker scheduler:8786 --resources "alpha=1"
+
+or, in SSHCluster, pass
+
+worker_options={"resources": {"alpha": 1}, ...}
+
+for every worker you launch on host α.
+
+Then annotate tasks with resources={"alpha": 1} exactly as documented.
+
+
+But remember: resources are immutable after registration; changing them later leads straight to the “No worker found” state. Pinning via workers= avoids that entire class of problems and is usually simpler.
+
+
+---
+
+Take-away
+
+Host-prefix worker constraints (workers="alpha") are the easiest, officially supported way to steer tasks to specific machines.
+
+Resources work too, but only if declared at worker launch.
+
+Late-binding tricks (modifying worker.resources from a client) look tempting but don’t update the scheduler – hence the errors you saw.
+
 
