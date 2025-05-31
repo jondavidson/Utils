@@ -11,23 +11,29 @@ Key features
 * Push or pull direction (local→remote or remote→local).
 * Recursive directory traversal.
 * Optional deletion of extraneous files on the destination.
+* **Selective date‑range sync** – limit transfer to YYYYMMDD sub‑directories
+  between *start_date* and *end_date* (inclusive).
 * Extensible transport layer (currently Paramiko SFTP; swap in SCP/HTTP, etc.).
 * Verbose progress display with **tqdm**.
 
 Example
 -------
 ```python
+from datetime import date
 from file_sync import FileSync, SSHConfig
 
-cfg = SSHConfig(host=\"my.server.com\", username=\"alice\")
+cfg = SSHConfig(host="my.server.com", username="alice")
 syncer = FileSync(cfg)
 
+# Push only backups created between 31 May and 2 June 2025, located in
+# sub‑directories named YYYYMMDD under /home/alice/backups
 syncer.sync(
-    local_dir=\"/home/alice/projects\", 
-    remote_dir=\"/data/backups/projects\",
-    direction=\"push\",          # \"push\" or \"pull\"
-    use_checksums=False,         # cheaper – compares mtime + size
-    delete_extraneous=True       # mirror semantics like rsync --delete
+    local_dir="/home/alice/backups", 
+    remote_dir="/data/backups",
+    direction="push",
+    start_date=date(2025, 5, 31),
+    end_date="20250602",           # str or datetime.date are accepted
+    include_non_dated=False        # skip everything outside dated dirs
 )
 ```
 """
@@ -39,14 +45,69 @@ import os
 import stat
 import time
 from dataclasses import dataclass
+from datetime import date as _date, datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
 import paramiko
 from tqdm import tqdm
 
-__all__ = ["SSHConfig", "FileSync"]
+__all__ = [
+    "SSHConfig",
+    "FileSync",
+]
 
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+
+def _sha256(path: Path, bufsize: int = 131_072) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(bufsize), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _sha256_remote(
+    sftp: paramiko.SFTPClient, remote_path: str, bufsize: int = 131_072
+) -> str:
+    h = hashlib.sha256()
+    with sftp.open(remote_path, "rb") as f:
+        while True:
+            chunk = f.read(bufsize)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _to_date(val: str | _date | None) -> _date | None:
+    """Convert *val* to a :class:`datetime.date` if possible.
+
+    Accepts:
+    * ``datetime.date`` – returned unchanged
+    * ``YYYYMMDD`` or ``YYYY-MM-DD`` strings
+    * ``None`` – returned unchanged
+    """
+    if val is None or isinstance(val, _date):
+        return val  # type: ignore[return-value]
+
+    if not isinstance(val, str):
+        raise TypeError("start_date/end_date must be str | datetime.date | None")
+
+    txt = val.replace("-", "").replace("/", "")
+    try:
+        return datetime.strptime(txt, "%Y%m%d").date()
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid date string '{val}'. Expected YYYYMMDD or YYYY-MM-DD"
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# SSH helpers
+# ---------------------------------------------------------------------------
 
 @dataclass
 class SSHConfig:
@@ -74,6 +135,10 @@ class SSHConfig:
         return client
 
 
+# ---------------------------------------------------------------------------
+# Metadata container
+# ---------------------------------------------------------------------------
+
 @dataclass(slots=True)
 class FileMeta:
     """Cheap serialisable metadata for a single file or directory."""
@@ -82,6 +147,8 @@ class FileMeta:
     size: int
     mtime: float
     sha256: str | None = None
+
+    # -------------- constructors --------------
 
     @classmethod
     def from_stat(
@@ -108,6 +175,8 @@ class FileMeta:
             sha = _sha256_remote(sftp, attr.filename)
         return cls(rel, attr.st_size, attr.st_mtime, sha)
 
+    # -------------- comparison --------------
+
     def is_different(self, other: "FileMeta", compare_checksums: bool) -> bool:
         """Return True if two FileMeta objects differ in relevant aspects."""
         if self.size != other.size or abs(self.mtime - other.mtime) > 1:
@@ -117,38 +186,31 @@ class FileMeta:
         return False
 
 
-def _sha256(path: Path, bufsize: int = 131072) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(bufsize), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def _sha256_remote(
-    sftp: paramiko.SFTPClient, remote_path: str, bufsize: int = 131072
-) -> str:
-    h = hashlib.sha256()
-    with sftp.open(remote_path, "rb") as f:
-        while True:
-            chunk = f.read(bufsize)
-            if not chunk:
-                break
-            h.update(chunk)
-    return h.hexdigest()
-
+# ---------------------------------------------------------------------------
+# Main class
+# ---------------------------------------------------------------------------
 
 class FileSync:
     """Synchronise a directory tree between local and remote hosts."""
+
+    # ------------------------------------------------------------
+    # Construction / context‑management
+    # ------------------------------------------------------------
 
     def __init__(self, ssh_config: SSHConfig) -> None:
         self.cfg = ssh_config
         self.ssh: paramiko.SSHClient | None = None
         self.sftp: paramiko.SFTPClient | None = None
 
-    # ---------------------------
+    def close(self) -> None:
+        if self.sftp:
+            self.sftp.close()
+        if self.ssh:
+            self.ssh.close()
+
+    # ------------------------------------------------------------
     # Public API
-    # ---------------------------
+    # ------------------------------------------------------------
 
     def sync(
         self,
@@ -159,6 +221,12 @@ class FileSync:
         use_checksums: bool = False,
         delete_extraneous: bool = False,
         dry_run: bool = False,
+        # ---- new selective date‑range options ----
+        start_date: str | _date | None = None,
+        end_date: str | _date | None = None,
+        date_component_index: int = 0,
+        date_format: str = "%Y%m%d",
+        include_non_dated: bool = True,
     ) -> None:
         """Synchronise *local_dir* <-> *remote_dir*.
 
@@ -172,19 +240,66 @@ class FileSync:
             Mirror behaviour – delete files that exist only in the destination.
         dry_run
             Compute the plan but do not transfer or delete anything.
+        start_date / end_date
+            If provided, restrict synchronisation to files whose **ancestor
+            component** at *date_component_index* is a valid date in
+            *date_format* and falls within the inclusive range
+            ``[start_date, end_date]``. Accepts ``datetime.date`` or strings
+            like ``"20250601"`` or ``"2025-06-01"``. ``None`` means open end.
+        date_component_index
+            Which path component (0‑based) should be interpreted as the date.
+            For a layout like ``base/YYYYMMDD/hh/file``, you might set it to 0
+            (default). If the date appears deeper (e.g. ``snapshots/DAILY/
+            YYYYMMDD/…``) adjust accordingly.
+        date_format
+            ``strptime`` format string used to parse the component – change if
+            you use a different naming convention (e.g. ``"%Y-%m-%d"``).
+        include_non_dated
+            *True* – keep files whose component **cannot** be parsed as a date
+            (i.e. treat them as always in range). *False* – exclude them.
         """
         if direction not in {"push", "pull"}:
             raise ValueError("direction must be 'push' or 'pull'")
         local_base = Path(local_dir).expanduser().resolve()
 
-        # Establish connection only once
+        # Prepare date filter -------------------------------------------------
+        sd = _to_date(start_date)
+        ed = _to_date(end_date)
+        if sd and ed and sd > ed:
+            raise ValueError("start_date must be <= end_date")
+
+        def in_date_range(rel: str) -> bool:  # closure captures sd/ed & args
+            comps = rel.split("/")
+            if len(comps) <= date_component_index:
+                # Path does not have the component.
+                return include_non_dated
+            comp = comps[date_component_index]
+            try:
+                d = datetime.strptime(comp, date_format).date()
+            except ValueError:
+                return include_non_dated
+            if sd and d < sd:
+                return False
+            if ed and d > ed:
+                return False
+            return True
+
+        # Establish connection only once --------------------------------------
         self._ensure_connection()
 
-        # Gather metadata
+        # Gather metadata ------------------------------------------------------
         local_meta = self._scan_local(local_base, use_checksums)
         remote_meta = self._scan_remote(remote_dir, use_checksums)
 
-        # Plan changes
+        if sd or ed or not include_non_dated:
+            local_meta = {
+                k: v for k, v in local_meta.items() if in_date_range(k)
+            }
+            remote_meta = {
+                k: v for k, v in remote_meta.items() if in_date_range(k)
+            }
+
+        # Plan changes ---------------------------------------------------------
         if direction == "push":
             src_meta, dst_meta = local_meta, remote_meta
             src_base, dst_base = local_base, remote_dir
@@ -198,26 +313,32 @@ class FileSync:
             src_meta, dst_meta, use_checksums, delete_extraneous
         )
 
-        self._log_plan(to_copy, to_delete, direction, dst_base)
+        self._log_plan(
+            to_copy,
+            to_delete,
+            direction,
+            dst_base,
+            sd,
+            ed,
+            date_component_index,
+            date_format,
+            include_non_dated,
+        )
 
         if dry_run:
             print("[DRY‑RUN] No changes performed.")
             return
 
-        # Execute plan
+        # Execute plan ---------------------------------------------------------
         self._copy_files(to_copy, src_base, dst_base, transfer)
         if delete_extraneous:
             self._delete_files(to_delete, dst_base, direction)
 
-    def close(self) -> None:
-        if self.sftp:
-            self.sftp.close()
-        if self.ssh:
-            self.ssh.close()
-
-    # ---------------------------
+    # ------------------------------------------------------------
     # Internal helpers
-    # ---------------------------
+    # ------------------------------------------------------------
+
+    # ------ connection ------
 
     def _ensure_connection(self) -> None:
         if self.ssh and self.sftp:
@@ -259,7 +380,7 @@ class FileSync:
                 meta[meta_val.path] = meta_val
         return meta
 
-    # ------ compare ------
+    # ------ comparison ------
 
     def _compare_trees(
         self,
@@ -369,11 +490,28 @@ class FileSync:
         to_delete: List[str],
         direction: str,
         dst_base: str | Path,
+        sd: _date | None,
+        ed: _date | None,
+        comp_idx: int,
+        date_fmt: str,
+        inc_non_dated: bool,
     ) -> None:
         print("==== Sync plan ====")
-        print(f"Direction : {direction}")
-        print(f"Destination: {dst_base}")
-        print(f"Copy       : {len(to_copy)} files")
-        print(f"Delete     : {len(to_delete)} files")
+        print(f"Direction      : {direction}")
+        print(f"Destination    : {dst_base}")
+        print(f"Copy           : {len(to_copy)} files")
+        print(f"Delete         : {len(to_delete)} files")
+        if sd or ed or not inc_non_dated:
+            r = (
+                f"[{sd.isoformat() if sd else '-∞'} – {ed.isoformat() if ed else '∞'}]"
+            )
+            print(
+                "Date filter    : component #{}, format '{}', range {} ({} non‑dated)".format(
+                    comp_idx,
+                    date_fmt,
+                    r,
+                    "include" if inc_non_dated else "exclude",
+                )
+            )
         print("===================")
         time.sleep(0.1)  # allow tqdm to start cleanly
