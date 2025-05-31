@@ -275,6 +275,10 @@ class FileSync:
             src_meta, dst_meta, use_checksums, delete_extraneous
         )
 
+        if use_checksums and to_copy:
+            to_copy = self._filter_with_checksums(to_copy, src_base, dst_base, direction)
+
+
         self._log_plan(
             to_copy,
             to_delete,
@@ -310,38 +314,32 @@ class FileSync:
 
     # ------ scanning ------
 
-    def _scan_local(
-        self, base: Path, use_checksums: bool
-    ) -> Dict[str, FileMeta]:
-        meta: Dict[str, FileMeta] = {}
-        for file_path in base.rglob("*"):
-            if file_path.is_symlink() or file_path.is_dir():
-                continue  # skip symlinks and directories
-            meta[file_path.relative_to(base).as_posix()] = FileMeta.from_stat(
-                base, file_path, use_checksums
-            )
-        return meta
-
-    def _scan_remote(
-        self, base: str, use_checksums: bool
-    ) -> Dict[str, FileMeta]:
-        assert self.sftp
-        meta: Dict[str, FileMeta] = {}
-        pending: List[str] = [base]
-        while pending:
-            current = pending.pop()
-            for attr in self.sftp.listdir_attr(current):
-                full = f"{current}/{attr.filename}"
-                if stat.S_ISLNK(attr.st_mode):
-                    continue
-                if stat.S_ISDIR(attr.st_mode):
-                    pending.append(full)
-                    continue  # don't record directories as transfer targets
-                meta_val = FileMeta.from_remote(
-                    base, full, attr, use_checksums, self.sftp
-                )
-                meta[meta_val.path] = meta_val
-        return meta
+    def _scan_local(self, base: Path) -> Dict[str, FileMeta]:
+      meta: Dict[str, FileMeta] = {}
+      for p in base.rglob("*"):
+          if p.is_symlink() or p.is_dir():
+              continue
+          st = p.stat()
+          rel = p.relative_to(base).as_posix()
+          meta[rel] = FileMeta(rel, st.st_size, st.st_mtime, sha256=None)
+      return meta
+    
+    def _scan_remote(self, base: str) -> Dict[str, FileMeta]:
+      assert self.sftp
+      meta: Dict[str, FileMeta] = {}
+      pending: List[str] = [base]
+      while pending:
+          current = pending.pop()
+          for attr in self.sftp.listdir_attr(current):
+              full = f"{current}/{attr.filename}"
+              if stat.S_ISLNK(attr.st_mode):
+                  continue
+              if stat.S_ISDIR(attr.st_mode):
+                  pending.append(full)
+                  continue
+              rel = os.path.relpath(full, base)
+              meta[rel] = FileMeta(rel, attr.st_size, attr.st_mtime, sha256=None)
+      return meta
 
     # ------ comparison ------
 
@@ -367,6 +365,32 @@ class FileSync:
 
         return to_copy, to_delete
 
+    def _filter_with_checksums(
+        self,
+        candidates: List[str],
+        src_base: str | Path,
+        dst_base: str | Path,
+        direction: str,
+    ) -> List[str]:
+        """Return subset of *candidates* whose content genuinely differs."""
+        kept: List[str] = []
+        for rel in tqdm(candidates, desc="checksum verify", unit="file"):
+            try:
+                if direction == "push":
+                    src_hash = _sha256(Path(src_base) / rel)
+                    dst_hash = _sha256_remote(self.sftp, f"{dst_base}/{rel}") if isinstance(dst_base, str) and self.sftp else None
+                else:  # pull
+                    src_hash = _sha256_remote(self.sftp, f"{src_base}/{rel}") if isinstance(src_base, str) else None
+                    dst_hash = _sha256(Path(dst_base) / rel)
+    
+                # if destination missing hash (file absent/unreadable), we must copy
+                if src_hash is None or dst_hash is None or src_hash != dst_hash:
+                    kept.append(rel)
+            except Exception as exc:
+                print(f"[WARN] checksum failed for {rel}: {exc} – will copy")
+                kept.append(rel)
+        return kept
+      
     # ------ transfer ------
 
     def _copy_files(
