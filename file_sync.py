@@ -1,6 +1,6 @@
 """file_sync.py
 
-A class‑based utility for synchronising directories between a local machine
+A class-based utility for synchronising directories between a local machine
 and one or more remote hosts over SSH/SFTP, inspired by **rsync** but written
 purely in Python.
 
@@ -25,15 +25,15 @@ from file_sync import FileSync, SSHConfig
 cfg = SSHConfig(host="my.server.com", username="alice")
 syncer = FileSync(cfg)
 
-# Push only backups created between 31 May and 2 June 2025, located in
+# Push only backups created between 31 May and 2 June 2025, located in
 # sub‑directories named YYYYMMDD under /home/alice/backups
 syncer.sync(
-    local_dir="/home/alice/backups", 
+    local_dir="/home/alice/backups",
     remote_dir="/data/backups",
     direction="push",
     start_date=date(2025, 5, 31),
-    end_date="20250602",           # str or datetime.date are accepted
-    include_non_dated=False        # skip everything outside dated dirs
+    end_date="20250602",          # str or datetime.date are accepted
+    include_non_dated=False       # skip everything outside dated dirs
 )
 ```
 """
@@ -47,7 +47,7 @@ import time
 from dataclasses import dataclass
 from datetime import date as _date, datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, List, Tuple
 
 import paramiko
 from tqdm import tqdm
@@ -83,13 +83,7 @@ def _sha256_remote(
 
 
 def _to_date(val: str | _date | None) -> _date | None:
-    """Convert *val* to a :class:`datetime.date` if possible.
-
-    Accepts:
-    * ``datetime.date`` – returned unchanged
-    * ``YYYYMMDD`` or ``YYYY-MM-DD`` strings
-    * ``None`` – returned unchanged
-    """
+    """Convert *val* to a :class:`datetime.date` if possible."""
     if val is None or isinstance(val, _date):
         return val  # type: ignore[return-value]
 
@@ -141,44 +135,46 @@ class SSHConfig:
 
 @dataclass(slots=True)
 class FileMeta:
-    """Cheap serialisable metadata for a single file or directory."""
+    """Cheap serialisable metadata for a single **file** (directories skipped)."""
 
-    path: str  # relative to base
+    path: str  # relative to base directory (POSIX style)
     size: int
     mtime: float
     sha256: str | None = None
 
-    # -------------- constructors --------------
+    # ------------------------------------------------------------------
+    # Constructors
+    # ------------------------------------------------------------------
 
     @classmethod
     def from_stat(
         cls, base: Path, file_path: Path, use_checksums: bool = False
     ) -> "FileMeta":
         st = file_path.stat()
-        sha = None
-        if use_checksums and file_path.is_file():
-            sha = _sha256(file_path)
-        rel = str(file_path.relative_to(base))
+        sha = _sha256(file_path) if use_checksums else None
+        rel = file_path.relative_to(base).as_posix()
         return cls(rel, st.st_size, st.st_mtime, sha)
 
     @classmethod
-    def from_sftp_attr(
+    def from_remote(
         cls,
         base: str,
+        full_path: str,
         attr: paramiko.SFTPAttributes,
-        use_checksums: bool = False,
-        sftp: paramiko.SFTPClient | None = None,
+        use_checksums: bool,
+        sftp: paramiko.SFTPClient,
     ) -> "FileMeta":
-        rel = os.path.relpath(attr.filename, base)
-        sha = None
-        if use_checksums and sftp and stat.S_ISREG(attr.st_mode):
-            sha = _sha256_remote(sftp, attr.filename)
+        sha = (
+            _sha256_remote(sftp, full_path) if use_checksums and stat.S_ISREG(attr.st_mode) else None
+        )
+        rel = os.path.relpath(full_path, base)
         return cls(rel, attr.st_size, attr.st_mtime, sha)
 
-    # -------------- comparison --------------
+    # ------------------------------------------------------------------
+    # Comparison helpers
+    # ------------------------------------------------------------------
 
     def is_different(self, other: "FileMeta", compare_checksums: bool) -> bool:
-        """Return True if two FileMeta objects differ in relevant aspects."""
         if self.size != other.size or abs(self.mtime - other.mtime) > 1:
             return True
         if compare_checksums:
@@ -194,7 +190,7 @@ class FileSync:
     """Synchronise a directory tree between local and remote hosts."""
 
     # ------------------------------------------------------------
-    # Construction / context‑management
+    # Construction / context-management
     # ------------------------------------------------------------
 
     def __init__(self, ssh_config: SSHConfig) -> None:
@@ -221,57 +217,27 @@ class FileSync:
         use_checksums: bool = False,
         delete_extraneous: bool = False,
         dry_run: bool = False,
-        # ---- new selective date‑range options ----
+        # ---- selective date range options ----
         start_date: str | _date | None = None,
         end_date: str | _date | None = None,
         date_component_index: int = 0,
         date_format: str = "%Y%m%d",
         include_non_dated: bool = True,
     ) -> None:
-        """Synchronise *local_dir* <-> *remote_dir*.
-
-        Parameters
-        ----------
-        direction
-            "push" to copy local changes to remote, "pull" for the opposite.
-        use_checksums
-            If *True*, calculate SHA‑256 digests to detect changes.
-        delete_extraneous
-            Mirror behaviour – delete files that exist only in the destination.
-        dry_run
-            Compute the plan but do not transfer or delete anything.
-        start_date / end_date
-            If provided, restrict synchronisation to files whose **ancestor
-            component** at *date_component_index* is a valid date in
-            *date_format* and falls within the inclusive range
-            ``[start_date, end_date]``. Accepts ``datetime.date`` or strings
-            like ``"20250601"`` or ``"2025-06-01"``. ``None`` means open end.
-        date_component_index
-            Which path component (0‑based) should be interpreted as the date.
-            For a layout like ``base/YYYYMMDD/hh/file``, you might set it to 0
-            (default). If the date appears deeper (e.g. ``snapshots/DAILY/
-            YYYYMMDD/…``) adjust accordingly.
-        date_format
-            ``strptime`` format string used to parse the component – change if
-            you use a different naming convention (e.g. ``"%Y-%m-%d"``).
-        include_non_dated
-            *True* – keep files whose component **cannot** be parsed as a date
-            (i.e. treat them as always in range). *False* – exclude them.
-        """
+        """Synchronise *local_dir* <-> *remote_dir* with optional date filter."""
         if direction not in {"push", "pull"}:
             raise ValueError("direction must be 'push' or 'pull'")
         local_base = Path(local_dir).expanduser().resolve()
 
-        # Prepare date filter -------------------------------------------------
+        # ------------------------- date filter ------------------------------
         sd = _to_date(start_date)
         ed = _to_date(end_date)
         if sd and ed and sd > ed:
             raise ValueError("start_date must be <= end_date")
 
-        def in_date_range(rel: str) -> bool:  # closure captures sd/ed & args
+        def in_date_range(rel: str) -> bool:
             comps = rel.split("/")
             if len(comps) <= date_component_index:
-                # Path does not have the component.
                 return include_non_dated
             comp = comps[date_component_index]
             try:
@@ -284,22 +250,18 @@ class FileSync:
                 return False
             return True
 
-        # Establish connection only once --------------------------------------
+        # ---------------------- establish connection ------------------------
         self._ensure_connection()
 
-        # Gather metadata ------------------------------------------------------
+        # --------------------------- scanning -------------------------------
         local_meta = self._scan_local(local_base, use_checksums)
         remote_meta = self._scan_remote(remote_dir, use_checksums)
 
         if sd or ed or not include_non_dated:
-            local_meta = {
-                k: v for k, v in local_meta.items() if in_date_range(k)
-            }
-            remote_meta = {
-                k: v for k, v in remote_meta.items() if in_date_range(k)
-            }
+            local_meta = {k: v for k, v in local_meta.items() if in_date_range(k)}
+            remote_meta = {k: v for k, v in remote_meta.items() if in_date_range(k)}
 
-        # Plan changes ---------------------------------------------------------
+        # ------------------------- comparison -------------------------------
         if direction == "push":
             src_meta, dst_meta = local_meta, remote_meta
             src_base, dst_base = local_base, remote_dir
@@ -329,7 +291,7 @@ class FileSync:
             print("[DRY‑RUN] No changes performed.")
             return
 
-        # Execute plan ---------------------------------------------------------
+        # -------------------------- execution -------------------------------
         self._copy_files(to_copy, src_base, dst_base, transfer)
         if delete_extraneous:
             self._delete_files(to_delete, dst_base, direction)
@@ -353,8 +315,8 @@ class FileSync:
     ) -> Dict[str, FileMeta]:
         meta: Dict[str, FileMeta] = {}
         for file_path in base.rglob("*"):
-            if file_path.is_symlink():
-                continue  # ignore symlinks
+            if file_path.is_symlink() or file_path.is_dir():
+                continue  # skip symlinks and directories
             meta[file_path.relative_to(base).as_posix()] = FileMeta.from_stat(
                 base, file_path, use_checksums
             )
@@ -374,8 +336,9 @@ class FileSync:
                     continue
                 if stat.S_ISDIR(attr.st_mode):
                     pending.append(full)
-                meta_val = FileMeta.from_sftp_attr(
-                    base, attr, use_checksums, self.sftp
+                    continue  # don't record directories as transfer targets
+                meta_val = FileMeta.from_remote(
+                    base, full, attr, use_checksums, self.sftp
                 )
                 meta[meta_val.path] = meta_val
         return meta
@@ -392,7 +355,6 @@ class FileSync:
         to_copy: List[str] = []
         to_delete: List[str] = []
 
-        # changed + new files
         for rel, sm in src_meta.items():
             dm = dst_meta.get(rel)
             if dm is None or sm.is_different(dm, compare_checksums):
@@ -423,11 +385,8 @@ class FileSync:
         assert self.sftp
         lpath = local_base / rel
         rpath = f"{remote_base}/{rel}"
-        # ensure remote dir exists
         self._mkdir_remote(os.path.dirname(rpath))
         self.sftp.put(str(lpath), rpath)
-
-        # preserve mtime
         st = lpath.stat()
         self.sftp.utime(rpath, (st.st_atime, st.st_mtime))
 
@@ -437,11 +396,8 @@ class FileSync:
         assert self.sftp
         rpath = f"{remote_base}/{rel}"
         lpath = local_base / rel
-        # ensure local dir exists
         lpath.parent.mkdir(parents=True, exist_ok=True)
         self.sftp.get(rpath, str(lpath))
-
-        # preserve mtime
         attr = self.sftp.stat(rpath)
         os.utime(lpath, (attr.st_atime, attr.st_mtime))
 
@@ -455,23 +411,16 @@ class FileSync:
             full = f"{base}/{rel}" if isinstance(base, str) else (base / rel)
             try:
                 if isinstance(full, Path):
-                    if full.is_dir():
-                        full.rmdir()
-                    else:
-                        full.unlink()
+                    full.unlink(missing_ok=True)
                 else:
                     assert self.sftp
-                    try:
-                        self.sftp.remove(full)
-                    except IOError:
-                        self.sftp.rmdir(full)
-            except Exception as exc:
+                    self.sftp.remove(full)
+            except IOError as exc:
                 print(f"[WARN] Failed to delete {full}: {exc}")
 
     # ------ misc ------
 
     def _mkdir_remote(self, remote_dir: str) -> None:
-        """Create remote directories recursively (mkdir -p)."""
         assert self.sftp
         dirs: List[str] = []
         while remote_dir not in {"", "/"}:
@@ -502,14 +451,12 @@ class FileSync:
         print(f"Copy           : {len(to_copy)} files")
         print(f"Delete         : {len(to_delete)} files")
         if sd or ed or not inc_non_dated:
-            r = (
-                f"[{sd.isoformat() if sd else '-∞'} – {ed.isoformat() if ed else '∞'}]"
-            )
+            rng = f"[{sd.isoformat() if sd else '-∞'} – {ed.isoformat() if ed else '∞'}]"
             print(
-                "Date filter    : component #{}, format '{}', range {} ({} non‑dated)".format(
+                "Date filter    : component #{}, format '{}', range {} ({} non-dated)".format(
                     comp_idx,
                     date_fmt,
-                    r,
+                    rng,
                     "include" if inc_non_dated else "exclude",
                 )
             )
