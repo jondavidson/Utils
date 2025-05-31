@@ -486,3 +486,47 @@ class FileSync:
             )
         print("===================")
         time.sleep(0.1)  # allow tqdm to start cleanly
+
+import re
+
+# ----------------------------------------------------------------------
+# Mapping table – extend if your naming scheme uses more directives
+# ----------------------------------------------------------------------
+_DIRECTIVE_REGEX = {
+    "%Y": r"\d{4}",                        # 2025
+    "%y": r"\d{2}",                        # 25
+    "%m": r"(0[1-9]|1[0-2])",              # 01-12
+    "%d": r"(0[1-9]|[12]\d|3[01])",        # 01-31
+    "%H": r"([01]\d|2[0-3])",              # 00-23
+    "%M": r"[0-5]\d",                      # 00-59
+    "%S": r"[0-5]\d",                      # 00-59
+}
+
+def datefmt_to_regex(date_format: str) -> str:
+    """
+    Convert a strftime/strptime *date_format* string into a regular-expression
+    that matches the corresponding text.
+
+    Example
+    -------
+    >>> pat = re.compile(datefmt_to_regex('%Y-%m-%d'))
+    >>> bool(pat.fullmatch('2025-05-31'))
+    True
+    >>> bool(pat.fullmatch('2025-15-99'))
+    False
+    """
+    parts: list[str] = []
+    i = 0
+    while i < len(date_format):
+        if date_format[i] == "%":                     # a directive
+            spec = date_format[i : i + 2]
+            repl = _DIRECTIVE_REGEX.get(spec)
+            if repl is None:                          # unknown -> literal
+                parts.append(re.escape(spec))
+            else:
+                parts.append(repl)
+            i += 2
+        else:                                         # ordinary char
+            parts.append(re.escape(date_format[i]))
+            i += 1
+    return "".join(parts)
